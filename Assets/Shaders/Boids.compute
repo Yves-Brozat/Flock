@@ -1,0 +1,609 @@
+#pragma kernel InitializeBoids
+#pragma kernel ClearGrid
+#pragma kernel BuildGrid
+#pragma kernel SimulateBoids
+
+struct BoidData
+{
+    float4 position;
+    float4 velocity;
+};
+
+struct ForceZoneData
+{
+    float4 positionRadius;
+    float4 directionStrength;
+    float4 parameters;
+};
+
+struct ObstacleData
+{
+    float4 positionShape;
+    float4 rotation;
+    float4 dimensionsAvoidance;
+    float4 parameters;
+};
+
+StructuredBuffer<BoidData> _BoidsRead;
+RWStructuredBuffer<BoidData> _BoidsWrite;
+RWStructuredBuffer<uint> _CellCounts;
+RWStructuredBuffer<uint> _CellBoidIndices;
+RWStructuredBuffer<uint> _OverflowCount;
+StructuredBuffer<ForceZoneData> _ForceZones;
+StructuredBuffer<ObstacleData> _Obstacles;
+
+uint _BoidCount;
+uint _GridCellCount;
+int3 _GridDimensions;
+uint _MaxBoidsPerCell;
+int _PreyCellSearchRadius;
+int _PredatorCellSearchRadius;
+
+float3 _BoundsCenter;
+float3 _BoundsSize;
+float _CellSize;
+float _DeltaTime;
+
+float _NeighborRadius;
+float _SeparationRadius;
+float _CohesionWeight;
+float _SeparationWeight;
+float _AlignmentWeight;
+float _BoundaryWeight;
+float _MinSpeed;
+float _MaxSpeed;
+float _MaxForce;
+float _PredatorFraction;
+float _PreyFleeRadius;
+float _PreyFleeWeight;
+float _PredatorHuntRadius;
+float _PredatorChaseWeight;
+float _PredatorSpeedMultiplier;
+float _PredatorForceMultiplier;
+float _PredatorFlockingMultiplier;
+uint _RandomSeed;
+uint _ForceZoneCount;
+uint _ObstacleCount;
+float _SimulationTime;
+float _MaxEnvironmentAcceleration;
+
+uint Hash(uint value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+float Random01(uint value)
+{
+    return (Hash(value) & 0x00ffffffu) / 16777216.0;
+}
+
+float3 ClampMagnitude(float3 value, float maximum)
+{
+    float magnitudeSquared = dot(value, value);
+    if (magnitudeSquared > maximum * maximum)
+    {
+        return value * (maximum * rsqrt(magnitudeSquared));
+    }
+
+    return value;
+}
+
+float3 SteeringTowards(
+    float3 desiredDirection,
+    float3 velocity,
+    float speciesMaxSpeed,
+    float speciesMaxForce)
+{
+    float directionSquared = dot(desiredDirection, desiredDirection);
+    if (directionSquared < 1e-8)
+    {
+        return 0.0;
+    }
+
+    float3 desiredVelocity = desiredDirection * (speciesMaxSpeed * rsqrt(directionSquared));
+    return ClampMagnitude(desiredVelocity - velocity, speciesMaxForce);
+}
+
+float3 RotateByQuaternion(float3 value, float4 rotation)
+{
+    return value + 2.0 * cross(
+        rotation.xyz,
+        cross(rotation.xyz, value) + rotation.w * value);
+}
+
+float3 RotateByInverseQuaternion(float3 value, float4 rotation)
+{
+    rotation.xyz = -rotation.xyz;
+    return RotateByQuaternion(value, rotation);
+}
+
+float ZoneFalloff(float3 position, float3 center, float radius, float exponent)
+{
+    float normalizedDistance = distance(position, center) / max(radius, 1e-4);
+    float linearFalloff = saturate(1.0 - normalizedDistance);
+    return pow(linearFalloff, max(exponent, 0.1));
+}
+
+float3 DivergenceFreeNoise(float3 samplePosition, float time)
+{
+    float3 p = samplePosition + float3(time, time * 1.37, -time * 0.73);
+    float3 firstOctave = float3(
+        sin(p.y) + cos(p.z),
+        sin(p.z) + cos(p.x),
+        sin(p.x) + cos(p.y));
+
+    p = p * 2.03 + float3(7.1, 3.7, 5.9);
+    float3 secondOctave = float3(
+        sin(p.y) + cos(p.z),
+        sin(p.z) + cos(p.x),
+        sin(p.x) + cos(p.y));
+
+    return ClampMagnitude(firstOctave * 0.65 + secondOctave * 0.35, 1.0);
+}
+
+float3 ComputeEnvironmentAcceleration(float3 position)
+{
+    float3 acceleration = 0.0;
+
+    for (uint zoneIndex = 0u; zoneIndex < _ForceZoneCount; ++zoneIndex)
+    {
+        ForceZoneData zone = _ForceZones[zoneIndex];
+        float3 center = zone.positionRadius.xyz;
+        float radius = zone.positionRadius.w;
+        float falloff = ZoneFalloff(position, center, radius, zone.parameters.y);
+        if (falloff <= 0.0)
+        {
+            continue;
+        }
+
+        uint forceType = (uint)round(zone.parameters.x);
+        float strength = zone.directionStrength.w;
+
+        if (forceType == 0u)
+        {
+            float noiseScale = zone.parameters.z;
+            float noiseSpeed = zone.parameters.w;
+            float3 noise = DivergenceFreeNoise(
+                (position - center) * noiseScale,
+                _SimulationTime * noiseSpeed);
+            acceleration += noise * (strength * falloff);
+        }
+        else if (forceType == 1u)
+        {
+            float3 direction = normalize(zone.directionStrength.xyz + 1e-8);
+            acceleration += direction * (strength * falloff);
+        }
+        else if (forceType == 2u)
+        {
+            float3 axis = normalize(zone.directionStrength.xyz + 1e-8);
+            float3 centerToBoid = position - center;
+            float3 radial = centerToBoid - axis * dot(centerToBoid, axis);
+            float radialLengthSquared = dot(radial, radial);
+            if (radialLengthSquared > 1e-8)
+            {
+                float3 radialDirection = radial * rsqrt(radialLengthSquared);
+                float3 tangent = cross(axis, radialDirection);
+                float inwardStrength = zone.parameters.z;
+                acceleration += (
+                    tangent * strength -
+                    radialDirection * inwardStrength) * falloff;
+            }
+        }
+        else if (forceType == 3u)
+        {
+            float3 centerToBoid = position - center;
+            float distanceSquared = dot(centerToBoid, centerToBoid);
+            if (distanceSquared > 1e-8)
+            {
+                float3 radialDirection = centerToBoid * rsqrt(distanceSquared);
+                acceleration += radialDirection * (strength * falloff);
+            }
+        }
+    }
+
+    return ClampMagnitude(acceleration, _MaxEnvironmentAcceleration);
+}
+
+void EvaluateSphereObstacle(
+    float3 localPosition,
+    float radius,
+    out float signedDistance,
+    out float3 localNormal)
+{
+    float lengthFromCenter = length(localPosition);
+    signedDistance = lengthFromCenter - radius;
+    localNormal = lengthFromCenter > 1e-5 ? localPosition / lengthFromCenter : float3(1.0, 0.0, 0.0);
+}
+
+void EvaluateBoxObstacle(
+    float3 localPosition,
+    float3 halfExtents,
+    out float signedDistance,
+    out float3 localNormal)
+{
+    float3 outside = abs(localPosition) - halfExtents;
+    float3 positiveOutside = max(outside, 0.0);
+    float outsideLength = length(positiveOutside);
+
+    if (outsideLength > 1e-5)
+    {
+        float3 closest = clamp(localPosition, -halfExtents, halfExtents);
+        localNormal = normalize(localPosition - closest);
+        signedDistance = outsideLength;
+        return;
+    }
+
+    float3 faceDistance = halfExtents - abs(localPosition);
+    if (faceDistance.x <= faceDistance.y && faceDistance.x <= faceDistance.z)
+    {
+        localNormal = float3(localPosition.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+        signedDistance = -faceDistance.x;
+    }
+    else if (faceDistance.y <= faceDistance.z)
+    {
+        localNormal = float3(0.0, localPosition.y >= 0.0 ? 1.0 : -1.0, 0.0);
+        signedDistance = -faceDistance.y;
+    }
+    else
+    {
+        localNormal = float3(0.0, 0.0, localPosition.z >= 0.0 ? 1.0 : -1.0);
+        signedDistance = -faceDistance.z;
+    }
+}
+
+void EvaluateCapsuleObstacle(
+    float3 localPosition,
+    float radius,
+    float segmentHalfLength,
+    out float signedDistance,
+    out float3 localNormal)
+{
+    float closestY = clamp(localPosition.y, -segmentHalfLength, segmentHalfLength);
+    float3 fromAxis = localPosition - float3(0.0, closestY, 0.0);
+    float axisDistance = length(fromAxis);
+    signedDistance = axisDistance - radius;
+    localNormal = axisDistance > 1e-5 ? fromAxis / axisDistance : float3(1.0, 0.0, 0.0);
+}
+
+float3 ComputeObstacleAvoidance(float3 position, float3 velocity)
+{
+    float3 avoidance = 0.0;
+
+    for (uint obstacleIndex = 0u; obstacleIndex < _ObstacleCount; ++obstacleIndex)
+    {
+        ObstacleData obstacle = _Obstacles[obstacleIndex];
+        float lookAheadTime = obstacle.parameters.y;
+        float3 queryPosition = position + velocity * lookAheadTime;
+        float3 localPosition = RotateByInverseQuaternion(
+            queryPosition - obstacle.positionShape.xyz,
+            obstacle.rotation);
+
+        float signedDistance;
+        float3 localNormal;
+        uint shape = (uint)round(obstacle.positionShape.w);
+
+        if (shape == 0u)
+        {
+            EvaluateSphereObstacle(
+                localPosition,
+                obstacle.dimensionsAvoidance.x,
+                signedDistance,
+                localNormal);
+        }
+        else if (shape == 1u)
+        {
+            EvaluateBoxObstacle(
+                localPosition,
+                obstacle.dimensionsAvoidance.xyz,
+                signedDistance,
+                localNormal);
+        }
+        else
+        {
+            EvaluateCapsuleObstacle(
+                localPosition,
+                obstacle.dimensionsAvoidance.x,
+                obstacle.dimensionsAvoidance.y,
+                signedDistance,
+                localNormal);
+        }
+
+        float avoidanceDistance = obstacle.dimensionsAvoidance.w;
+        if (signedDistance >= avoidanceDistance)
+        {
+            continue;
+        }
+
+        float proximity = saturate(1.0 - max(signedDistance, 0.0) / max(avoidanceDistance, 1e-4));
+        float3 worldNormal = RotateByQuaternion(localNormal, obstacle.rotation);
+        avoidance += worldNormal * (obstacle.parameters.x * proximity * proximity);
+    }
+
+    return avoidance;
+}
+
+int3 PositionToCell(float3 position)
+{
+    float3 boundsMinimum = _BoundsCenter - _BoundsSize * 0.5;
+    int3 cell = (int3)floor((position - boundsMinimum) / _CellSize);
+    return clamp(cell, int3(0, 0, 0), _GridDimensions - 1);
+}
+
+uint FlattenCell(int3 cell)
+{
+    return (uint)(cell.x + _GridDimensions.x * (cell.y + _GridDimensions.y * cell.z));
+}
+
+[numthreads(256, 1, 1)]
+void InitializeBoids(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint id = dispatchThreadId.x;
+    if (id >= _BoidCount)
+    {
+        return;
+    }
+
+    uint seed = id * 4u + _RandomSeed * 747796405u;
+    float3 randomPosition = float3(
+        Random01(seed + 0u),
+        Random01(seed + 1u),
+        Random01(seed + 2u)) - 0.5;
+
+    float3 randomDirection = float3(
+        Random01(seed + 11u),
+        Random01(seed + 12u),
+        Random01(seed + 13u)) * 2.0 - 1.0;
+    randomDirection = normalize(randomDirection + float3(1e-4, 0.0, 0.0));
+
+    float isPredator = Random01(seed + 31u) < _PredatorFraction ? 1.0 : 0.0;
+    float speedMultiplier = lerp(1.0, _PredatorSpeedMultiplier, isPredator);
+
+    BoidData boid;
+    boid.position = float4(_BoundsCenter + randomPosition * _BoundsSize * 0.9, isPredator);
+    boid.velocity = float4(
+        randomDirection * lerp(_MinSpeed, _MaxSpeed, Random01(seed + 21u)) * speedMultiplier,
+        0.0);
+    _BoidsWrite[id] = boid;
+}
+
+[numthreads(256, 1, 1)]
+void ClearGrid(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint id = dispatchThreadId.x;
+    if (id < _GridCellCount)
+    {
+        _CellCounts[id] = 0u;
+    }
+
+    if (id == 0u)
+    {
+        _OverflowCount[0] = 0u;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void BuildGrid(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint id = dispatchThreadId.x;
+    if (id >= _BoidCount)
+    {
+        return;
+    }
+
+    int3 cell = PositionToCell(_BoidsRead[id].position.xyz);
+    uint flatCell = FlattenCell(cell);
+    uint slot;
+    InterlockedAdd(_CellCounts[flatCell], 1u, slot);
+
+    if (slot < _MaxBoidsPerCell)
+    {
+        _CellBoidIndices[flatCell * _MaxBoidsPerCell + slot] = id;
+    }
+    else
+    {
+        InterlockedAdd(_OverflowCount[0], 1u);
+    }
+}
+
+[numthreads(256, 1, 1)]
+void SimulateBoids(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint id = dispatchThreadId.x;
+    if (id >= _BoidCount)
+    {
+        return;
+    }
+
+    BoidData boid = _BoidsRead[id];
+    float3 position = boid.position.xyz;
+    float3 velocity = boid.velocity.xyz;
+    bool isPredator = boid.position.w > 0.5;
+    int3 ownCell = PositionToCell(position);
+
+    float3 flockPositionSum = 0.0;
+    float3 flockVelocitySum = 0.0;
+    float3 separationSum = 0.0;
+    float3 predatorAvoidanceSum = 0.0;
+    float3 nearestPreyOffset = 0.0;
+    float nearestPreyDistanceSquared = 3.402823466e+38;
+    uint flockNeighborCount = 0u;
+    uint separationCount = 0u;
+    uint predatorThreatCount = 0u;
+
+    float neighborRadiusSquared = _NeighborRadius * _NeighborRadius;
+    float separationRadiusSquared = _SeparationRadius * _SeparationRadius;
+    float preyFleeRadiusSquared = _PreyFleeRadius * _PreyFleeRadius;
+    float predatorHuntRadiusSquared = _PredatorHuntRadius * _PredatorHuntRadius;
+    int cellSearchRadius = isPredator ? _PredatorCellSearchRadius : _PreyCellSearchRadius;
+
+    for (int z = -cellSearchRadius; z <= cellSearchRadius; ++z)
+    {
+        for (int y = -cellSearchRadius; y <= cellSearchRadius; ++y)
+        {
+            for (int x = -cellSearchRadius; x <= cellSearchRadius; ++x)
+            {
+                int3 cell = ownCell + int3(x, y, z);
+                if (any(cell < 0) || any(cell >= _GridDimensions))
+                {
+                    continue;
+                }
+
+                uint flatCell = FlattenCell(cell);
+                uint count = min(_CellCounts[flatCell], _MaxBoidsPerCell);
+                uint firstIndex = flatCell * _MaxBoidsPerCell;
+
+                for (uint cellIndex = 0u; cellIndex < count; ++cellIndex)
+                {
+                    uint otherId = _CellBoidIndices[firstIndex + cellIndex];
+                    if (otherId == id)
+                    {
+                        continue;
+                    }
+
+                    BoidData other = _BoidsRead[otherId];
+                    float3 offset = other.position.xyz - position;
+                    float distanceSquared = dot(offset, offset);
+                    bool otherIsPredator = other.position.w > 0.5;
+
+                    if (distanceSquared < separationRadiusSquared && distanceSquared > 1e-8)
+                    {
+                        separationSum -= offset / distanceSquared;
+                        separationCount++;
+                    }
+
+                    if (isPredator == otherIsPredator && distanceSquared <= neighborRadiusSquared)
+                    {
+                        flockPositionSum += other.position.xyz;
+                        flockVelocitySum += other.velocity.xyz;
+                        flockNeighborCount++;
+                    }
+
+                    if (!isPredator && otherIsPredator &&
+                        distanceSquared <= preyFleeRadiusSquared && distanceSquared > 1e-8)
+                    {
+                        predatorAvoidanceSum -= offset / distanceSquared;
+                        predatorThreatCount++;
+                    }
+
+                    if (isPredator && !otherIsPredator &&
+                        distanceSquared <= predatorHuntRadiusSquared &&
+                        distanceSquared < nearestPreyDistanceSquared)
+                    {
+                        nearestPreyDistanceSquared = distanceSquared;
+                        nearestPreyOffset = offset;
+                    }
+                }
+            }
+        }
+    }
+
+    float speedMultiplier = isPredator ? _PredatorSpeedMultiplier : 1.0;
+    float forceMultiplier = isPredator ? _PredatorForceMultiplier : 1.0;
+    float speciesMinSpeed = _MinSpeed * speedMultiplier;
+    float speciesMaxSpeed = _MaxSpeed * speedMultiplier;
+    float speciesMaxForce = _MaxForce * forceMultiplier;
+    float flockingMultiplier = isPredator ? _PredatorFlockingMultiplier : 1.0;
+
+    // Voluntary behaviours share a steering budget. Environmental acceleration
+    // is added separately so a current does not consume all flocking authority.
+    float3 steeringAcceleration = 0.0;
+    if (flockNeighborCount > 0u)
+    {
+        float inverseNeighborCount = rcp((float)flockNeighborCount);
+        float3 averagePosition = flockPositionSum * inverseNeighborCount;
+        float3 averageVelocity = flockVelocitySum * inverseNeighborCount;
+
+        steeringAcceleration += SteeringTowards(
+            averagePosition - position,
+            velocity,
+            speciesMaxSpeed,
+            speciesMaxForce) * (_CohesionWeight * flockingMultiplier);
+        steeringAcceleration += SteeringTowards(
+            averageVelocity,
+            velocity,
+            speciesMaxSpeed,
+            speciesMaxForce) * (_AlignmentWeight * flockingMultiplier);
+    }
+
+    if (separationCount > 0u)
+    {
+        float3 averageSeparation = separationSum / (float)separationCount;
+        steeringAcceleration += SteeringTowards(
+            averageSeparation,
+            velocity,
+            speciesMaxSpeed,
+            speciesMaxForce) * _SeparationWeight;
+    }
+
+    if (!isPredator && predatorThreatCount > 0u)
+    {
+        float3 fleeDirection = predatorAvoidanceSum / (float)predatorThreatCount;
+        steeringAcceleration += SteeringTowards(
+            fleeDirection,
+            velocity,
+            speciesMaxSpeed,
+            speciesMaxForce) * _PreyFleeWeight;
+    }
+
+    if (isPredator && nearestPreyDistanceSquared <= predatorHuntRadiusSquared)
+    {
+        steeringAcceleration += SteeringTowards(
+            nearestPreyOffset,
+            velocity,
+            speciesMaxSpeed,
+            speciesMaxForce) * _PredatorChaseWeight;
+    }
+
+    float3 halfBounds = _BoundsSize * 0.5;
+    float3 normalizedOffset = (position - _BoundsCenter) / max(halfBounds, 1e-4);
+    float3 boundaryAmount = saturate((abs(normalizedOffset) - 0.8) / 0.2);
+    float3 boundaryDirection = -sign(normalizedOffset) * boundaryAmount;
+    steeringAcceleration += boundaryDirection * (_BoundaryWeight * speciesMaxForce);
+    steeringAcceleration += ComputeObstacleAvoidance(position, velocity);
+    steeringAcceleration = ClampMagnitude(steeringAcceleration, speciesMaxForce);
+
+    float3 environmentAcceleration = ComputeEnvironmentAcceleration(position);
+    float3 acceleration = steeringAcceleration + environmentAcceleration;
+
+    velocity += acceleration * _DeltaTime;
+    float speedSquared = dot(velocity, velocity);
+    if (speedSquared > 1e-8)
+    {
+        float speed = sqrt(speedSquared);
+        float clampedSpeed = clamp(speed, speciesMinSpeed, speciesMaxSpeed);
+        velocity *= clampedSpeed / speed;
+    }
+    else
+    {
+        velocity = float3(speciesMinSpeed, 0.0, 0.0);
+    }
+
+    position += velocity * _DeltaTime;
+
+    float3 boundsMinimum = _BoundsCenter - halfBounds;
+    float3 boundsMaximum = _BoundsCenter + halfBounds;
+    if (position.x < boundsMinimum.x || position.x > boundsMaximum.x)
+    {
+        velocity.x *= -1.0;
+        position.x = clamp(position.x, boundsMinimum.x, boundsMaximum.x);
+    }
+    if (position.y < boundsMinimum.y || position.y > boundsMaximum.y)
+    {
+        velocity.y *= -1.0;
+        position.y = clamp(position.y, boundsMinimum.y, boundsMaximum.y);
+    }
+    if (position.z < boundsMinimum.z || position.z > boundsMaximum.z)
+    {
+        velocity.z *= -1.0;
+        position.z = clamp(position.z, boundsMinimum.z, boundsMaximum.z);
+    }
+
+    boid.position = float4(position, isPredator ? 1.0 : 0.0);
+    boid.velocity = float4(velocity, 0.0);
+    _BoidsWrite[id] = boid;
+}
